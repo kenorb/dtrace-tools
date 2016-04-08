@@ -4,3 +4,6 @@
 [submodule "dtrace-cloud-tools"]
 	path = dtrace-cloud-tools
 	url = https://github.com/kenorb-contrib/dtrace-cloud-tools
+[submodule "DTrace-book-scripts"]
+	path = DTrace-book-scripts
+	url = https://github.com/kenorb-contrib/DTrace-book-scripts.git
