@@ -1,6 +1,6 @@
-[submodule "dtruss-lamp"]
-	path = dtruss-lamp
-	url = https://github.com/kenorb/dtruss-lamp.git
+[submodule "dtrace-lamp"]
+	path = dtrace-lamp
+	url = https://github.com/kenorb/dtrace-lamp.git
 [submodule "dtrace-cloud-tools"]
 	path = dtrace-cloud-tools
 	url = https://github.com/kenorb-contrib/dtrace-cloud-tools
