@@ -1,0 +1,309 @@
+#!/bin/sh
+
+# timerfires
+
+FORMAT='"%8d %5d  %-16s  %-16s  "'
+CURRENTTIME='(walltimestamp - starttime) / 1000000'
+
+specifiers=0
+
+opt_pid=0; pid=0
+opt_name=0; pname=""
+opt_timeout=0; timeout=0
+opt_stack=0
+opt_verbose=0
+opt_aggregate=0
+
+function print_usage() {
+	cat <<-END >&2
+usage:
+        `basename $0` [-t <timeout>] [-p <pid> | -n <name>] [-s]
+
+        -t <timeout>     length of time to run in seconds
+        -p <pid>         filter to process with pid
+        -n <name>        filter to process with name
+        -s               show stacks for non-callout timers
+        -v               show verbose output where applicable
+        -g               aggregate output
+END
+	exit 1
+}
+
+while getopts ap:n:st:vgh name
+do
+	case $name in
+	a)      specifiers=`expr $specifiers + 1` ;;
+	p)      opt_pid=1; pid=$OPTARG; specifiers=`expr $specifiers + 1` ;;
+	n)      opt_name=1; pname=$OPTARG; specifiers=`expr $specifiers + 1` ;;
+	s)      opt_stack=1 ;;
+	t)      opt_timeout=1; timeout=$OPTARG ;;
+	v)      opt_verbose=1 ;;
+	g)      opt_aggregate=1 ;;
+	h|?)    print_usage ;;
+	esac
+done
+
+if [ $opt_stack -eq 1 ]
+then
+	STACK='stack();'
+	USTACK='ustack();'
+else
+	STACK='printf("\n");'
+	USTACK='printf("\n");'
+fi
+
+if [ $specifiers -ne 1 ]
+then
+	print_usage
+fi
+
+if [[ $opt_name -eq 1 && ${#pname} -gt 15 ]]
+then
+	pname=$(echo "$pname" | cut -c1-15)
+	echo "Warning: Truncating process name to 15 characters: $pname"
+fi
+
+dtrace='
+BEGIN
+{
+	starttime = walltimestamp;
+	printf("%8s %5s  %-16s  %-16s    %s\n", "TIME(ms)", "PID", "PROCESS", "TYPE", "TIMER ROUTINE");
+}
+
+dispatch*:::timer-fire
+/
+	(!'$opt_name' || execname == "'$pname'") &&
+	(!'$opt_pid' || pid == '$pid')
+/
+{
+	printf('$FORMAT', '$CURRENTTIME', pid, execname, "dispatch");
+	usym(arg1);
+	printf("\n");
+}
+
+CFRunLoop*:::timer_fired
+/
+	(!'$opt_name' || execname == "'$pname'") &&
+	(!'$opt_pid' || pid == '$pid')
+/
+{
+	printf('$FORMAT', '$CURRENTTIME', pid, execname, "CF");
+	'$opt_verbose' ? printf("(%s %s) ", copyinstr(arg2), copyinstr(arg3)) : 1;
+	usym(arg4);
+	printf("\n");
+}
+
+/* user TTE wakeup */
+fbt::thread_dispatch:entry
+/
+	(!'$opt_name' || execname == "'$pname'") &&
+	(!'$opt_pid' || pid == '$pid') &&
+	curthread->wait_result == 1 /* THREAD_TIMED_OUT */ &&
+	curthread->task != `kernel_task
+/
+{
+	printf('$FORMAT', '$CURRENTTIME', pid, execname, "sleep");
+	'$USTACK'
+}
+
+/* kernel TTE wakeup */
+fbt::thread_dispatch:entry
+/
+	(!'$opt_name' || "kernel_task" == "'$pname'") &&
+	(!'$opt_pid' || 0 == '$pid') &&
+	curthread->wait_result == 1 /* THREAD_TIMED_OUT */ &&
+	curthread->task == `kernel_task
+/
+{
+	printf('$FORMAT', '$CURRENTTIME', pid, execname, "sleep");
+	'$STACK'
+}
+
+/* kernel_task TTE with continuation */
+sdt:::callout-start
+/
+	(!'$opt_name' || "kernel_task"  == "'$pname'") &&
+	(!'$opt_pid' || 0 == '$pid') &&
+	arg0 == (uint64_t)&mach_kernel`thread_timer_expire &&
+	((thread_t)arg1)->task == `kernel_task &&
+	!((thread_t)arg1)->kernel_stack
+/
+{
+	thread = (thread_t)arg1;
+
+	task = ((thread_t)arg1)->task;
+	proc = (proc_t)task->bsd_info;
+	procname = proc ? proc->p_comm : "???";
+	procpid = proc ? proc->p_pid : 0;
+
+	printf('$FORMAT', '$CURRENTTIME', procpid, procname, "contsleep");
+	sym((uint64_t)thread->continuation);
+	printf("\n");
+}
+
+/* other timer call */
+sdt:::callout-start
+/
+	(!'$opt_name' || "kernel_task" == "'$pname'") &&
+	(!'$opt_pid' || 0 == '$pid') &&
+	arg0 != (uint64_t)&mach_kernel`thread_timer_expire &&
+	arg0 != (uint64_t)&mach_kernel`thread_call_delayed_timer &&
+	arg0 != (uint64_t)&mach_kernel`thread_quantum_expire
+/
+{
+	printf('$FORMAT', '$CURRENTTIME', 0, "kernel_task", "timercall");
+	sym(arg0);
+	printf("\n");
+}
+
+sdt:::thread_callout-start
+/ arg4 /
+{
+	self->accounted_for = 0;
+}
+
+/* threadcall */
+sdt:::thread_callout-end
+/
+	(!'$opt_name' || "kernel_task" == "'$pname'") &&
+	(!'$opt_pid' || 0 == '$pid') &&
+	!self->accounted_for &&
+	arg4
+/
+{
+	printf('$FORMAT', '$CURRENTTIME', 0, "kernel_task", "threadcall");
+	sym(arg0);
+	printf("\n");
+}
+
+fbt::thread_unblock:entry
+/ ((thread_t)arg0)->task != `kernel_task /
+{
+	self->accounted_for = 1;
+}
+
+fbt::mach_msg_send_from_kernel_proper:entry,
+fbt::knote:entry
+{
+	self->accounted_for = 1;
+}
+
+/* IOTES */
+sdt:::iotescallout-expire
+/
+	(!'$opt_name' || "kernel_task" == "'$pname'") &&
+	(!'$opt_pid' || 0 == '$pid')
+/
+{
+	self->accounted_for = 1;
+
+	printf('$FORMAT', '$CURRENTTIME', 0, "kernel_task", "IOTES");
+	sym(arg0);
+	printf("\n");
+}
+'
+
+if [ $opt_timeout -eq 1 ]
+then
+	dtrace=$dtrace'
+tick-'$timeout's
+{
+	exit(0);
+}
+'
+fi
+
+if [ $opt_aggregate -eq 1 ]
+then
+	aggregator='
+use strict;
+
+my $got_sigint = 0;
+
+sub sigint {
+	if ($got_sigint) {
+		exit(1)
+	}
+
+	$got_sigint = 1;
+}
+
+$SIG{INT} = \&sigint;
+
+my $aggregation = {};
+
+my $collectstack = 0;
+my $stack = "";
+
+my ($time, $pid, $procname, $type, $symbol);
+
+while (<>) {
+	chomp;
+
+	if (/^TIME/) {
+		next;
+	} elsif (/^ +([0-9]+) +([0-9]+)  ([^ ]+(?: [^ ]+)*)  +(sleep|dispatch|CF|threadcall|IOTES|timercall)  (.*)$/) {
+		if ($collectstack == 1) {
+			$aggregation->{$pid}->{$procname}->{$type}->{$symbol}->{$stack}++;
+			$stack = "";
+			$collectstack = 0;
+		}
+
+		($time, $pid, $procname, $type, $symbol) = ($1, $2, $3, $4, $5);
+
+		if ($type eq "sleep") {
+			$collectstack = 1;
+		} else {
+			$aggregation->{$pid}->{$procname}->{$type}->{$symbol}->{""}++;
+		}
+	} else {
+		if ($collectstack) {
+			$stack .= $_ . "\n";
+		}
+	}
+}
+
+my $i;
+my ($tuplesref, $valuesref) = tuples_and_values_of_nested_hash($aggregation);
+for ($i = 0; $i < scalar @$tuplesref; $i++) {
+	my ($pid, $procname, $type, $symbol, $stack) = @{ ${$tuplesref}[$i] };
+	my $value = ${$valuesref}[$i];
+	printf("%8d %5d  %-16s  %-16s  %s%s", $value, $pid, $procname, $type, $symbol, ($stack ne "") ? "\n" . $stack : "\n");
+}
+
+# n * log(n)
+sub tuples_and_values_of_nested_hash {
+	my $hash = shift;
+	my @tuples = ();
+	my @values = ();
+
+	foreach my $key (keys %$hash) {
+		if (ref $hash->{$key} eq "HASH") {
+			my $i;
+			my ($subtuplesref, $subvaluesref) = tuples_and_values_of_nested_hash($hash->{$key});
+
+			for ($i = 0; $i < scalar @$subtuplesref; $i++) {
+				my @subtuple = @{ ${$subtuplesref}[$i] };
+				my $subvalue = ${$subvaluesref}[$i];
+
+				push @tuples, [$key, @subtuple];
+				push @values, $subvalue;
+			}
+		} else {
+			push @tuples, [$key];
+			push @values, $hash->{$key};
+		}
+	}
+
+	my @permutation = sort { $values[$a] <=> $values[$b] } (0..$#values);
+	@tuples = @tuples[@permutation];
+	@values = @values[@permutation];
+
+	return (\@tuples, \@values);
+}
+'
+
+	/usr/sbin/dtrace -Cqn "$dtrace" | /usr/bin/perl -w -e "$aggregator"
+else
+	exec /usr/sbin/dtrace -Cqn "$dtrace"
+fi
