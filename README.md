@@ -146,6 +146,11 @@ Successful signal details:
 
     dtrace -n 'proc:::signal-send /pid/ { printf("%s -%d %d",execname,args[2],args[1]->pr_pid); }'
 
+Trace PHP functions:
+
+    sudo dtrace -qn 'php*:::function-entry { printf("%Y: PHP function-entry:\t%s%s%s() in %s:%d\n", walltimestamp, copyinstr(arg3), copyinstr(arg4), copyinstr(arg0), basename(copyinstr(arg1)), (int)arg2); }'
+
+
 ### References
 
 Most of these onliners are in the [DTraceToolkit](http://www.solarisinternals.com/wiki/index.php/DTraceToolkit) as docs/oneliners.txt, and as Appendix B in Solaris Performance and Tools.
