@@ -1,4 +1,4 @@
-#!/usr/bin/ksh
+#!/usr/bin/env ksh
 #
 # dexplorer - DTrace system explorer, runs a collection of scripts.
 #             Written using DTrace (Solaris 10 3/05).
